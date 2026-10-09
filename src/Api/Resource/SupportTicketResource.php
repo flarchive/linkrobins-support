@@ -1,0 +1,728 @@
+<?php
+
+namespace LinkRobins\Support\Api\Resource;
+
+use Carbon\Carbon;
+use Flarum\Api\Context as FlarumContext;
+use Flarum\Api\Endpoint;
+use Flarum\Api\Resource\AbstractDatabaseResource;
+use Flarum\Api\Schema;
+use Flarum\Api\Sort\SortColumn;
+use Flarum\Locale\TranslatorInterface;
+use Illuminate\Contracts\Bus\Dispatcher;
+use Flarum\User\User;
+use Illuminate\Database\Eloquent\Builder;
+use LinkRobins\Support\Access\SupportAbilities;
+use LinkRobins\Support\Job\NotifyAssigned;
+use LinkRobins\Support\Job\NotifyStatusChanged;
+use LinkRobins\Support\RateLimiter;
+use LinkRobins\Support\SupportCategory;
+use LinkRobins\Support\SupportTicket;
+use LinkRobins\Support\UserState;
+use Tobyz\JsonApiServer\Context;
+use Tobyz\JsonApiServer\Exception\BadRequestException;
+use Tobyz\JsonApiServer\Exception\ForbiddenException;
+
+class SupportTicketResource extends AbstractDatabaseResource
+{
+    /**
+     * Status and assignment as they were when this request's update began,
+     * keyed by ticket id. Captured in updating() because Eloquent re-syncs
+     * originals during save(), so by the time saved() runs the previous values
+     * are gone -- and the notification wording depends on knowing them.
+     *
+     * @var array<int, array{status: ?string, assignee: ?int}>
+     */
+    protected array $before = [];
+
+    public function __construct(
+        protected RateLimiter $rateLimiter,
+        protected TranslatorInterface $translator,
+        protected Dispatcher $bus,
+    ) {
+    }
+
+    public function type(): string
+    {
+        return 'linkrobins-support-tickets';
+    }
+
+    public function model(): string
+    {
+        return SupportTicket::class;
+    }
+
+    /**
+     * Visibility scope.
+     *
+     * IMPORTANT: this scope runs on Show endpoints (single-resource GETs).
+     * For Index (list) endpoints, Flarum uses the Searcher infrastructure
+     * instead (see LinkRobins\Support\Search\TicketSearcher). The two must
+     * apply the same visibility rules or staff could see less on Index
+     * than on Show, or vice versa.
+     *
+     * Rules (mirrored in TicketSearcher::getQuery):
+     *   - Admins: all tickets
+     *   - Staff (`lr-support.handle_tickets`): all tickets
+     *   - Authenticated users: only their own tickets
+     *   - Guests: nothing
+     */
+    public function scope(Builder $query, Context $context): void
+    {
+        /** @var \Illuminate\Database\Eloquent\Builder<SupportTicket> $query */
+        // Eager-load reply counts (see TicketSearcher) so the replyCount field
+        // reads a column instead of issuing a COUNT() per ticket.
+        $query->withCount([
+            'replies as reply_count_all',
+            'replies as reply_count_public' => fn ($q) => $q->where('is_internal_note', false),
+        ]);
+
+        $actor = $context->getActor();
+        if ($actor->isGuest()) {
+            $query->whereRaw('1 = 0');
+            return;
+        }
+        $isStaff = SupportAbilities::isStaff($actor);
+        SupportTicket::withUnreadFor($query, $actor, $isStaff);
+        if ($isStaff) {
+            // Staff see soft-deleted tickets too so they can restore
+            // or force-delete from the ticket detail page. The default
+            // Eloquent SoftDeletes scope (which excludes trashed rows)
+            // applies for everyone else.
+            $query->withTrashed();
+            return;
+        }
+        $query->where('linkrobins_support_tickets.user_id', (int) $actor->id);
+    }
+
+    public function endpoints(): array
+    {
+        return [
+            Endpoint\Show::make()
+                ->authenticated()
+                ->defaultInclude(['user', 'category', 'assignedStaff']),
+            Endpoint\Index::make()
+                ->authenticated()
+                ->defaultInclude(['user', 'category', 'assignedStaff'])
+                ->paginate(25, 100),
+            Endpoint\Create::make()
+                ->authenticated()
+                ->can('createTicket'),
+            Endpoint\Update::make()
+                ->authenticated()
+                ->can('update'),
+                // Policy::update enforces staff-only for status/decision/
+                // assignment changes. Field setters defend-in-depth too,
+                // so even if this gate ever loosened the data couldn't
+                // change.
+            Endpoint\Delete::make()
+                ->authenticated()
+                ->can('delete'),
+        ];
+    }
+
+    public function sorts(): array
+    {
+        return [
+            SortColumn::make('lastReplyAt')->descendingAlias('latest'),
+            SortColumn::make('createdAt')->descendingAlias('newest')->ascendingAlias('oldest'),
+        ];
+    }
+
+    public function fields(): array
+    {
+        return [
+            Schema\Str::make('subject')
+                ->writable()
+                ->maxLength(200)
+                ->set(function (SupportTicket $ticket, $value) {
+                    $trimmed = is_string($value) ? trim($value) : '';
+                    // The column is NOT NULL but accepts ''. Without this
+                    // guard a direct API call with subject: '' would save a
+                    // blank-subject ticket (the frontend submit button is
+                    // the only other gate). Reject it with a clean 400.
+                    if ($trimmed === '') {
+                        throw new BadRequestException($this->translator->trans('linkrobins-support.api.subject_required'));
+                    }
+                    $ticket->subject = $trimmed;
+                }),
+
+            // Write-only virtual field carrying the ticket's opening message.
+            // It maps to no column; create() consumes the raw value from the
+            // request body and posts it as the first reply inside the same
+            // transaction (see create()), so a ticket can never be saved
+            // without its body. Mirrors how core's DiscussionResource accepts
+            // `content` for the first post. requiredOnCreate guarantees the
+            // attribute is present; the reply resource enforces non-empty.
+            Schema\Str::make('firstPost')
+                ->writableOnCreate()
+                ->requiredOnCreate()
+                ->visible(false)
+                ->set(fn () => null),
+
+            Schema\Str::make('status')
+                ->writableOnUpdate()
+                ->set(function (SupportTicket $ticket, $value, FlarumContext $context) {
+                    if (! is_string($value)) {
+                        return;
+                    }
+                    if (! in_array($value, SupportTicket::ALL_STATUSES, true)) {
+                        return;
+                    }
+                    $actor = $context->getActor();
+                    if (SupportAbilities::isStaff($actor)) {
+                        $ticket->status = $value;
+                        return;
+                    }
+                    // Non-staff: the owner of a non-appeal ticket may make two
+                    // moves only: reopen it when closed (closed -> open), or
+                    // confirm it solved when resolved (resolved -> closed).
+                    // Appeals stay staff-only so a suspended user can't reopen
+                    // a rejected appeal. Everything else from a non-staff actor
+                    // is ignored.
+                    if (
+                        $this->ownerMayReopen($ticket, $actor)
+                        && $value === SupportTicket::STATUS_OPEN
+                    ) {
+                        $ticket->status = $value;
+                    } elseif (
+                        $this->ownerMayConfirmSolved($ticket, $actor)
+                        && $value === SupportTicket::STATUS_CLOSED
+                    ) {
+                        $ticket->status = $value;
+                    }
+                }),
+
+            // Staff triage only: members neither see nor set it.
+            Schema\Str::make('priority')
+                ->visible(fn (SupportTicket $ticket, FlarumContext $context) => SupportAbilities::isStaff($context->getActor()))
+                ->writableOnUpdate()
+                ->set(function (SupportTicket $ticket, $value, FlarumContext $context) {
+                    if (! SupportAbilities::isStaff($context->getActor())) {
+                        return;
+                    }
+                    if (is_string($value) && in_array($value, SupportTicket::ALL_PRIORITIES, true)) {
+                        $ticket->priority = $value;
+                    }
+                }),
+
+            Schema\Str::make('decision')
+                ->writableOnUpdate()
+                ->nullable()
+                ->set(function (SupportTicket $ticket, $value, FlarumContext $context) {
+                    if ($value !== null && ! in_array($value, SupportTicket::ALL_DECISIONS, true)) {
+                        return;
+                    }
+                    $actor = $context->getActor();
+                    $isStaff = SupportAbilities::isStaff($actor);
+                    if (! $isStaff) {
+                        return;
+                    }
+                    $ticket->decision = $value;
+                }),
+
+            Schema\DateTime::make('createdAt')
+                ->property('created_at'),
+            Schema\DateTime::make('updatedAt')
+                ->property('updated_at'),
+            Schema\DateTime::make('lastReplyAt')
+                ->property('last_reply_at')
+                ->nullable(),
+
+            Schema\Integer::make('replyCount')
+                ->get(function (SupportTicket $ticket, FlarumContext $context) {
+                    $actor = $context->getActor();
+                    $isStaff = ! $actor->isGuest()
+                        && (SupportAbilities::isStaff($actor));
+                    // Prefer the eager-loaded counts (see TicketSearcher / scope).
+                    $col = $isStaff ? 'reply_count_all' : 'reply_count_public';
+                    if (isset($ticket->$col)) {
+                        return (int) $ticket->$col;
+                    }
+                    // Fallback for any path that didn't eager-load them.
+                    $q = $ticket->replies();
+                    if (! $isStaff) {
+                        $q->where('is_internal_note', false);
+                    }
+                    return $q->count();
+                }),
+
+            // New replies since the actor last opened this ticket. Computed by
+            // SupportTicket::withUnreadFor on every list and show query.
+            Schema\Boolean::make('isUnread')
+                ->get(fn (SupportTicket $ticket) => (bool) ($ticket->is_unread ?? false)),
+
+            Schema\Boolean::make('canReply')
+                ->get(function (SupportTicket $ticket, FlarumContext $context) {
+                    $actor = $context->getActor();
+                    if ($actor->isGuest()) {
+                        return false;
+                    }
+                    try {
+                        return $actor->can('reply', $ticket);
+                    } catch (\Throwable $e) {
+                        return false;
+                    }
+                }),
+
+            // Whether the current actor may reopen this (closed) ticket: staff
+            // can reopen any closed ticket; an owner can reopen their own closed
+            // NON-appeal ticket. Drives the Reopen button (the staff bar uses it
+            // too; owners get a button on the closed-ticket notice).
+            Schema\Boolean::make('canReopen')
+                ->get(function (SupportTicket $ticket, FlarumContext $context) {
+                    $actor = $context->getActor();
+                    if ($actor->isGuest() || $ticket->status !== SupportTicket::STATUS_CLOSED) {
+                        return false;
+                    }
+                    return SupportAbilities::isStaff($actor) || $this->ownerMayReopen($ticket, $actor);
+                }),
+
+            // Drives the "Did this solve your problem?" prompt for the owner
+            // of a resolved ticket.
+            Schema\Boolean::make('canConfirmSolved')
+                ->get(function (SupportTicket $ticket, FlarumContext $context) {
+                    return $this->ownerMayConfirmSolved($ticket, $context->getActor());
+                }),
+
+            Schema\Boolean::make('canUpdate')
+                ->get(function (SupportTicket $ticket, FlarumContext $context) {
+                    $actor = $context->getActor();
+                    if ($actor->isGuest()) {
+                        return false;
+                    }
+                    try {
+                        return $actor->can('update', $ticket);
+                    } catch (\Throwable $e) {
+                        return false;
+                    }
+                }),
+
+            Schema\Boolean::make('canPostInternalNote')
+                ->get(function (SupportTicket $ticket, FlarumContext $context) {
+                    $actor = $context->getActor();
+                    if ($actor->isGuest()) {
+                        return false;
+                    }
+                    try {
+                        return $actor->can('postInternalNote', $ticket);
+                    } catch (\Throwable $e) {
+                        return false;
+                    }
+                }),
+
+            // Whether the current actor is permitted to ever delete
+            // this ticket (admin only, per SupportTicketPolicy). The
+            // frontend uses this to show the moderation menu in the
+            // ticket header.
+            Schema\Boolean::make('canDelete')
+                ->get(function (SupportTicket $ticket, FlarumContext $context) {
+                    $actor = $context->getActor();
+                    if ($actor->isGuest()) {
+                        return false;
+                    }
+                    try {
+                        return $actor->can('delete', $ticket);
+                    } catch (\Throwable $e) {
+                        return false;
+                    }
+                }),
+
+            // Writable boolean toggling the ticket's soft-delete
+            // state. PATCH isDeleted=true soft-deletes (deleted_at
+            // set); PATCH isDeleted=false restores. Same pattern as
+            // SupportReplyResource. Gated by the update policy (any
+            // staff with handle_tickets can do this; the permanent
+            // DELETE is admin-only per the delete policy).
+            Schema\Boolean::make('isDeleted')
+                ->get(fn (SupportTicket $ticket) => $ticket->deleted_at !== null)
+                ->writable(function (SupportTicket $ticket, FlarumContext $context) {
+                    if (! $context->updating()) {
+                        return false;
+                    }
+                    $actor = $context->getActor();
+                    if ($actor->isGuest()) {
+                        return false;
+                    }
+                    return SupportAbilities::isStaff($actor);
+                })
+                ->set(function (SupportTicket $ticket, bool $value, FlarumContext $context) {
+                    if ($value && $ticket->deleted_at === null) {
+                        $ticket->deleted_at = \Carbon\Carbon::now();
+                    } elseif (! $value && $ticket->deleted_at !== null) {
+                        $ticket->deleted_at = null;
+                    }
+                }),
+
+            Schema\DateTime::make('deletedAt')
+                ->property('deleted_at'),
+
+            Schema\Relationship\ToOne::make('user')
+                ->type('users')
+                ->includable(),
+
+            Schema\Relationship\ToOne::make('assignedStaff')
+                ->type('users')
+                ->includable()
+                ->writableOnUpdate()
+                ->set(function (SupportTicket $ticket, $value, FlarumContext $context) {
+                    $actor = $context->getActor();
+                    $isStaff = SupportAbilities::isStaff($actor);
+                    if (! $isStaff) {
+                        return;
+                    }
+                    if ($value === null) {
+                        $ticket->assigned_staff_id = null;
+                        return;
+                    }
+                    $targetId = null;
+                    if (is_object($value) && isset($value->id)) {
+                        $targetId = (int) $value->id;
+                    } elseif (is_numeric($value)) {
+                        $targetId = (int) $value;
+                    }
+                    if (! $targetId) {
+                        return;
+                    }
+                    // Only allow assigning to an actual staff member. Without
+                    // this, a ticket could be assigned to any user id -- a
+                    // non-staff account or a non-existent one -- creating an
+                    // inconsistent state and surfacing a stranger's profile as
+                    // the ticket's "assigned staff".
+                    $target = User::query()->find($targetId);
+                    if (! $target || ! SupportAbilities::isStaff($target)) {
+                        throw new BadRequestException($this->translator->trans('linkrobins-support.api.assign_staff_only'));
+                    }
+                    $ticket->assigned_staff_id = $targetId;
+                }),
+
+            Schema\Relationship\ToOne::make('category')
+                ->type('linkrobins-support-categories')
+                ->includable()
+                ->writable()
+                ->set(function (SupportTicket $ticket, $value, FlarumContext $context) {
+                    // Defense in depth: only staff may (re)assign a ticket's
+                    // category. The Update endpoint is already staff-only and
+                    // create resolves the category in creating(), so this guard
+                    // keeps the field safe even if those gates ever change --
+                    // a non-staff owner must not be able to move a ticket into
+                    // (or out of) an appeal category and dodge the create-time
+                    // ban/suspension/rate checks.
+                    $actor = $context->getActor();
+                    if (! (SupportAbilities::isStaff($actor))) {
+                        return;
+                    }
+                    if (is_object($value) && isset($value->id)) {
+                        $ticket->category_id = (int) $value->id;
+                    } elseif (is_numeric($value)) {
+                        $ticket->category_id = (int) $value;
+                    }
+                }),
+        ];
+    }
+
+    /**
+     * Whether $actor may reopen $ticket as its owner: they own it, it is
+     * currently closed, and it is not an appeal (appeals stay staff-only so a
+     * suspended user can't reopen a rejected appeal). Called before the status
+     * setter reassigns, so $ticket->status is still the persisted value.
+     */
+    /**
+     * Whether $actor may close $ticket by confirming it solved: they own it,
+     * staff have marked it resolved, and it is not an appeal.
+     */
+    protected function ownerMayConfirmSolved(SupportTicket $ticket, User $actor): bool
+    {
+        if ($actor->isGuest() || (int) $actor->id !== (int) $ticket->user_id) {
+            return false;
+        }
+        if ($ticket->status !== SupportTicket::STATUS_RESOLVED) {
+            return false;
+        }
+        $category = $ticket->category;
+
+        return ! ($category && $category->is_appeal);
+    }
+
+    protected function ownerMayReopen(SupportTicket $ticket, User $actor): bool
+    {
+        if ($actor->isGuest() || (int) $actor->id !== (int) $ticket->user_id) {
+            return false;
+        }
+        if ($ticket->status !== SupportTicket::STATUS_CLOSED) {
+            return false;
+        }
+        $category = $ticket->category;
+
+        return ! ($category && $category->is_appeal);
+    }
+
+    public function creating(object $model, Context $context): ?object
+    {
+        /** @var SupportTicket $model */
+        $actor = $context->getActor();
+
+        // Force user_id to the acting user. Same anti-impersonation guard
+        // we apply on the blog: never trust relationships.user from the
+        // request body. A request can't create a ticket "from" another
+        // user, regardless of what JSON it sends.
+        if (! $actor->isGuest()) {
+            $model->user_id = $actor->id;
+        }
+
+        // Resolve the requested category. JSON:API gives it to us via the
+        // relationship, but in `creating` the model isn't fully hydrated
+        // yet -- so we pull it from the request body directly.
+        $body = $context->body();
+        $categoryRel = data_get($body, 'data.relationships.category.data.id');
+        $category = null;
+        if (is_numeric($categoryRel)) {
+            $category = SupportCategory::query()->find((int) $categoryRel);
+            if ($category) {
+                $model->category_id = $category->id;
+            }
+        }
+        if (! $category) {
+            throw new BadRequestException($this->translator->trans('linkrobins-support.api.category_required'));
+        }
+
+        // Check rate limits BEFORE the model saves. The limiter knows about
+        // appeal vs. general and produces a structured rejection reason.
+        $rate = $this->rateLimiter->check($actor, $category);
+        if (! $rate['ok']) {
+            throw new ForbiddenException($this->rateLimiter->describe($rate));
+        }
+
+        // Ban-state vs. category. A suspended user can create *appeal*
+        // tickets but not general ones. Without this check, a suspended
+        // user could bypass their ban by filing a general support
+        // ticket and using it as a chat channel.
+        // Note: Flarum has no built-in isBanned() method. We treat a
+        // currently-suspended user (from flarum/suspend) as banned for
+        // support purposes -- via UserState::isSuspended().
+        if (UserState::isSuspended($actor) && ! $category->is_appeal) {
+            throw new ForbiddenException(
+                'Your account is restricted from creating general support tickets. You may file an appeal instead.'
+            );
+        }
+
+        // Auto-assign, when the category routes to someone. effective...()
+        // returns null if that user is no longer staff, which leaves the
+        // ticket unassigned -- and SupportNotifier then notifies the whole
+        // staff list rather than one person who cannot act on it.
+        //
+        // This runs in creating(), not created(), so assigned_staff_id is part
+        // of the insert. The notification job is dispatched from the created
+        // hook and reads the row back; on the default sync queue it runs
+        // inline, so an assignment written afterwards would arrive too late to
+        // steer the radius.
+        if ($assignee = $category->effectiveDefaultAssignee()) {
+            $model->assigned_staff_id = $assignee->id;
+        }
+
+        // Initial status. For appeal tickets we also set decision=pending so
+        // the staff list shows it explicitly as awaiting decision.
+        $model->status = SupportTicket::STATUS_OPEN;
+        if ($category->is_appeal) {
+            $model->decision = SupportTicket::DECISION_PENDING;
+        }
+
+        // last_reply_at starts at created_at so newly-opened tickets sort
+        // correctly on the activity-sorted list.
+        $model->last_reply_at = Carbon::now();
+
+        return $model;
+    }
+
+    /**
+     * Serialize a single user's concurrent ticket creation so the rate-limit
+     * check and the insert are effectively atomic. Firing N parallel create
+     * requests would otherwise let each one pass the count-based check in
+     * creating() before any had inserted (TOCTOU), blowing past the appeal /
+     * general quotas. We take a row lock on the actor inside a transaction and
+     * re-run the limit check immediately before the insert. The creating()
+     * check still runs first as a fast, lock-free reject for the common case.
+     */
+    public function create(object $model, Context $context): object
+    {
+        /** @var SupportTicket $model */
+        $actor = $context->getActor();
+
+        if ($actor->isGuest() || empty($model->category_id)) {
+            return parent::create($model, $context);
+        }
+
+        return SupportTicket::query()->getConnection()->transaction(function () use ($model, $context, $actor) {
+            // Lock this user's row for the duration of the insert so their
+            // concurrent creates serialize (a no-op on SQLite, which already
+            // serializes writes). The re-check below then sees a consistent,
+            // committed count.
+            User::query()->whereKey($actor->id)->lockForUpdate()->first();
+
+            $category = SupportCategory::query()->find((int) $model->category_id);
+            if ($category) {
+                $rate = $this->rateLimiter->check($actor, $category);
+                if (! $rate['ok']) {
+                    throw new ForbiddenException($this->rateLimiter->describe($rate));
+                }
+            }
+
+            $ticket = parent::create($model, $context);
+
+            // Post the opening message as the ticket's first reply, atomically
+            // with the insert above. This used to be a second client request
+            // (save ticket, then POST reply): if that second request failed,
+            // the forum was left with a subject-only ticket the owner couldn't
+            // fix. Creating it here, in the same transaction, means a failed
+            // body rolls the whole thing back -- no body-less tickets.
+            $this->createFirstReply($ticket, $context);
+
+            return $ticket;
+        });
+    }
+
+    /**
+     * Create the ticket's opening message as its first reply, inside the
+     * caller's transaction. Reuses SupportReplyResource's create endpoint so
+     * the body runs through the same validation, formatting and
+     * SupportReply::created side-effects (last_reply_at bump, notifications)
+     * as any other reply. Mirrors how core's DiscussionResource posts the
+     * first post via PostResource. A failure here (e.g. empty body, rejected
+     * by the reply resource) bubbles up and rolls back the ticket insert.
+     */
+    protected function createFirstReply(SupportTicket $ticket, Context $context): void
+    {
+        $content = data_get($context->body(), 'data.attributes.firstPost');
+
+        $context->api
+            ->forResource(SupportReplyResource::class)
+            ->forEndpoint('create')
+            ->withRequest($context->request)
+            ->process([
+                'data' => [
+                    'attributes' => [
+                        'content' => $content,
+                    ],
+                    'relationships' => [
+                        'ticket' => [
+                            'data' => [
+                                'type' => 'linkrobins-support-tickets',
+                                'id' => (string) $ticket->id,
+                            ],
+                        ],
+                    ],
+                ],
+            ]);
+    }
+
+    public function updating(object $model, Context $context): ?object
+    {
+        /** @var SupportTicket $model */
+        // Block user_id tampering on update. Same anti-impersonation guard
+        // as on create. Staff legitimately editing a ticket might
+        // accidentally include the user relationship; we silently revert.
+        $originalUserId = $model->getOriginal('user_id');
+        if ((int) $model->user_id !== (int) $originalUserId) {
+            $model->user_id = $originalUserId;
+        }
+
+        // The owner-reopen path loosens the update policy for non-staff owners,
+        // and the subject setter has no staff gate -- so revert any subject
+        // change from a non-staff actor here. The status setter already limits
+        // them to closed -> open, so reopening is the only effective change.
+        $actor = $context->getActor();
+        if (! $actor->isGuest() && ! SupportAbilities::isStaff($actor) && $model->isDirty('subject')) {
+            $model->subject = $model->getOriginal('subject');
+        }
+
+        // Credit status and assignment changes in the ticket timeline to the
+        // person making this request (see SupportEvent::recordChanges).
+        $model->eventActorId = $actor->isGuest() ? null : (int) $actor->id;
+
+        $this->before[(int) $model->id] = [
+            'status' => $model->getOriginal('status'),
+            'assignee' => $model->getOriginal('assigned_staff_id') === null
+                ? null
+                : (int) $model->getOriginal('assigned_staff_id'),
+        ];
+
+        return $model;
+    }
+
+    /**
+     * Announce deliberate changes once the row is safely written.
+     *
+     * This hook is the reason status notifications do not double up with reply
+     * notifications: replying also moves a ticket's status, but that happens on
+     * the model inside SupportReply::created and never comes through the API
+     * resource, so it cannot reach this code. Only a human picking a status --
+     * the staff bar, closing, an owner reopening -- lands here.
+     */
+    public function saved(object $model, Context $context): ?object
+    {
+        /** @var SupportTicket $model */
+        $before = $this->before[(int) $model->id] ?? null;
+        unset($this->before[(int) $model->id]);
+
+        if ($before === null) {
+            return $model; // a create, not an update
+        }
+
+        $actor = $context->getActor();
+        $actorId = $actor->isGuest() ? null : (int) $actor->id;
+        $changes = $model->getChanges();
+
+        if (array_key_exists('status', $changes) && $changes['status'] !== $before['status']) {
+            $this->bus->dispatch(new NotifyStatusChanged(
+                (int) $model->id,
+                (string) $changes['status'],
+                $before['status'],
+                $actorId,
+            ));
+        }
+
+        $assignee = array_key_exists('assigned_staff_id', $changes)
+            ? ($changes['assigned_staff_id'] === null ? null : (int) $changes['assigned_staff_id'])
+            : null;
+
+        // Only a new assignee is worth announcing. Unassigning tells nobody --
+        // there is no one to tell -- and re-saving the same assignee is not a
+        // handover.
+        if ($assignee !== null && $assignee !== $before['assignee']) {
+            $this->bus->dispatch(new NotifyAssigned((int) $model->id, $actorId));
+        }
+
+        return $model;
+    }
+
+    /**
+     * Authorize permanent deletion of a ticket.
+     *
+     * The delete policy already restricts this to admins. Here we add
+     * the soft-delete-first requirement: a ticket must already be
+     * soft-deleted (deleted_at set) before it can be force-deleted.
+     * That mirrors the reply moderation flow -- accidental DELETE on
+     * a live ticket returns 400 instead of irreversibly wiping the
+     * row plus all its replies (the FK cascade would otherwise
+     * detonate everything in one click).
+     */
+    public function deleting(object $model, Context $context): void
+    {
+        /** @var SupportTicket $model */
+        if ($model->deleted_at === null) {
+            throw new BadRequestException(
+                $this->translator->trans('linkrobins-support.api.ticket_soft_delete_first')
+            );
+        }
+
+        // Force-delete the row here so it actually goes away. A plain
+        // delete() on an already-trashed SoftDeletes model just refreshes
+        // deleted_at, so the row would survive. forceDelete() bypasses the
+        // soft-delete scope and removes it (cascade-deleting replies via the
+        // FK constraint). After this the model's `exists` flag is false, so
+        // the framework's subsequent delete() call is a documented Eloquent
+        // no-op (delete() returns early when the model doesn't exist) -- this
+        // is well-defined behaviour, not a reliance on internals.
+        $model->forceDelete();
+    }
+}
